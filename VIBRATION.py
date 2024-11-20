@@ -1,116 +1,223 @@
 import streamlit as st
 import numpy as np
 import pywt
-from scipy.signal import welch
+from scipy.signal import welch, butter, filtfilt
 import plotly.graph_objects as go
 import websocket
 import threading
 import json
-import time
+from sklearn.ensemble import RandomForestClassifier
+
 
 # ------------------------------
-# 1. Batch Initialization
+# Signal Generation Functions
 # ------------------------------
 
-# Initialize session states
-if "data_buffer" not in st.session_state:
-    st.session_state["data_buffer"] = []
-if "last_update_time" not in st.session_state:
-    st.session_state["last_update_time"] = time.time()
-if "ws_status" not in st.session_state:
-    st.session_state["ws_status"] = "Disconnected"
-if "stop_thread" not in st.session_state:
-    st.session_state["stop_thread"] = False
+def generate_imbalance_signal(frequency, sampling_rate, duration, imbalance_amp=0.5):
+    t = np.linspace(0, duration, int(sampling_rate * duration))
+    signal = np.sin(2 * np.pi * frequency * t) + imbalance_amp * np.sin(2 * np.pi * 2 * frequency * t)
+    return t, signal
+
+
+def generate_misalignment_signal(frequency, mod_freq, mod_index, sampling_rate, duration):
+    t = np.linspace(0, duration, int(sampling_rate * duration))
+    carrier = np.sin(2 * np.pi * frequency * t)
+    modulator = 1 + mod_index * np.sin(2 * np.pi * mod_freq * t)
+    signal = carrier * modulator
+    return t, signal
+
+
+def generate_bearing_fault_signal(bpfo, sampling_rate, duration, fault_amp=0.5):
+    t = np.linspace(0, duration, int(sampling_rate * duration))
+    signal = fault_amp * np.sin(2 * np.pi * bpfo * t) + np.random.normal(0, 0.1, len(t))
+    return t, signal
+
 
 # ------------------------------
-# 2. WebSocket Integration
+# DWT Analysis Function
 # ------------------------------
 
-def process_batch(data_buffer):
-    """Process a batch of data for visualization."""
-    x_vals = [data["x"] for data in data_buffer]
-    y_vals = [data["y"] for data in data_buffer]
-    z_vals = [data["z"] for data in data_buffer]
-    return np.array(x_vals), np.array(y_vals), np.array(z_vals)
+def perform_dwt_analysis(signal, wavelet="db4", level=4):
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
+    return coeffs
+
+
+# ------------------------------
+# Signal Filtering Function
+# ------------------------------
+
+def butter_filter(signal, cutoff, fs, order=4):
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return filtfilt(b, a, signal)
+
+
+# ------------------------------
+# WebSocket Integration for Real-Time Data
+# ------------------------------
+
+devices = ["Machine 1", "Machine 2", "Machine 3"]
+device_data = {device: [] for device in devices}
+
 
 def on_message(ws, message):
-    """Handle incoming WebSocket messages."""
-    try:
-        data = json.loads(message)
-        st.session_state["data_buffer"].append(data)
+    data = json.loads(message)
+    device_id = data["device_id"]
+    device_data[device_id].append([data["x"], data["y"], data["z"]])
 
-        # Process and visualize if buffer is large enough
-        if len(st.session_state["data_buffer"]) >= 160:  # Process every 0.1 seconds
-            batch = st.session_state["data_buffer"]
-            x, y, z = process_batch(batch)
-            visualize_data(x, y, z)
-            st.session_state["data_buffer"] = []  # Clear buffer
-    except json.JSONDecodeError:
-        st.warning("Received malformed data from WebSocket.")
+    # Visualize data for the specific device
+    if len(device_data[device_id]) >= 160:
+        # Process the real-time data here (you can add a custom function for processing)
+        pass
 
-def on_error(ws, error):
-    """Handle WebSocket errors."""
-    st.error(f"WebSocket error: {error}")
-    st.session_state["ws_status"] = "Error"
-
-def on_close(ws, close_status_code, close_msg):
-    """Handle WebSocket closure."""
-    st.warning("WebSocket closed.")
-    st.session_state["ws_status"] = "Disconnected"
 
 def websocket_thread():
-    """WebSocket thread to handle real-time data."""
-    st.session_state["ws_status"] = "Connecting"
-    try:
-        ws = websocket.WebSocketApp(
-            "ws://192.168.137.114/ws",
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-        st.session_state["ws_status"] = "Connected"
-        ws.run_forever()
-    except Exception as e:
-        st.error(f"WebSocket connection failed: {e}")
-        st.session_state["ws_status"] = "Disconnected"
+    ws = websocket.WebSocketApp("ws://192.168.137.114/ws", on_message=on_message)
+    ws.run_forever()
 
-# Start WebSocket thread
-if not st.session_state.get("thread_started", False):
-    thread = threading.Thread(target=websocket_thread, daemon=True)
-    thread.start()
-    st.session_state["thread_started"] = True
+
+if "real_time_signal" not in st.session_state:
+    st.session_state["real_time_signal"] = np.zeros(100)
+
+thread = threading.Thread(target=websocket_thread)
+thread.daemon = True
+thread.start()
+
 
 # ------------------------------
-# 3. Visualization Functions
+# Fault Classification and Severity Calculation
 # ------------------------------
 
-def visualize_data(x, y, z):
-    """Update charts with new batch of data."""
-    if time.time() - st.session_state["last_update_time"] > 0.1:
-        st.session_state["last_update_time"] = time.time()
+def extract_features_from_dwt(coeffs):
+    features = []
+    for coeff in coeffs:
+        features.append(np.sum(coeff ** 2))  # Energy of the coefficients
+        features.append(np.mean(np.abs(coeff)))  # Mean absolute value
+        features.append(np.std(coeff))  # Standard deviation
+    return features
 
-        # Plot time-domain signals
-        st.subheader("Time-Domain Signals")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(y=x, mode="lines", name="X-Axis"))
-        fig.add_trace(go.Scatter(y=y, mode="lines", name="Y-Axis"))
-        fig.add_trace(go.Scatter(y=z, mode="lines", name="Z-Axis"))
-        fig.update_layout(title="Real-Time Data", xaxis_title="Samples", yaxis_title="Amplitude")
-        st.plotly_chart(fig)
 
-        # Frequency spectrum using Welch's method
-        st.subheader("Frequency Spectrum")
-        freq_x, psd_x = welch(x, fs=1600)
-        fig_freq = go.Figure()
-        fig_freq.add_trace(go.Scatter(x=freq_x, y=psd_x, mode="lines", name="X-Axis"))
-        fig_freq.update_layout(title="Frequency Spectrum (X-Axis)", xaxis_title="Frequency (Hz)", yaxis_title="Power")
-        st.plotly_chart(fig_freq)
+def calculate_severity(coeffs):
+    severity = 0
+    for coeff in coeffs:
+        energy = np.sum(coeff ** 2)
+        severity += energy
+    return severity
+
+
+# Example classifier (replace with real model after training)
+classifier = RandomForestClassifier()
+
+
+def classify_fault(coeffs, classifier):
+    features = extract_features_from_dwt(coeffs)
+    prediction = classifier.predict([features])
+    return prediction
+
 
 # ------------------------------
-# 4. Streamlit Interface
+# Streamlit App with Advanced Features
 # ------------------------------
 
-st.title("Optimized Real-Time Vibration Monitoring")
-st.sidebar.header("Configuration Options")
-st.sidebar.info("Ensure the Wi-Fi module is connected and streaming data.")
-st.sidebar.write(f"WebSocket Status: {st.session_state['ws_status']}")
+st.title("Future-Ready Fault Detection System")
+st.markdown(
+    """
+    ## Revolutionizing Fault Detection with IoT and Wavelet Analysis
+    This application demonstrates advanced methodologies for fault detection in rotating machinery.
+    It leverages **real-time sensor data**, **wavelet transform analysis**, and **interactive visualizations**.
+    """
+)
+st.sidebar.header("Configuration Panel")
+
+# ------------------------------
+# Fault Selection and Configurations
+# ------------------------------
+
+fault_types = ["Real-Time Sensor Data", "Imbalance", "Misalignment", "Bearing Fault"]
+selected_fault = st.sidebar.selectbox("Select Fault Type", fault_types)
+
+wavelet_type = st.sidebar.selectbox("Select Wavelet", ["db4", "haar", "sym5"])
+decomposition_level = st.sidebar.slider("Decomposition Level", 1, 6, 4)
+sampling_rate = 1600
+duration = 1
+
+# Signal Generation Based on Selected Fault
+if selected_fault == "Real-Time Sensor Data":
+    signal = st.session_state["real_time_signal"]
+    t = np.linspace(0, duration, len(signal))  # Ensuring t is always defined
+else:
+    fault_amp = st.sidebar.slider("Fault Amplitude", 0.1, 1.0, 0.5)
+    if selected_fault == "Imbalance":
+        t, signal = generate_imbalance_signal(frequency=60, sampling_rate=sampling_rate, duration=duration,
+                                              imbalance_amp=fault_amp)
+    elif selected_fault == "Misalignment":
+        mod_freq = st.sidebar.slider("Modulation Frequency", 1, 10, 5)
+        mod_index = st.sidebar.slider("Modulation Index", 0.1, 1.0, 0.5)
+        t, signal = generate_misalignment_signal(frequency=60, mod_freq=mod_freq, mod_index=mod_index,
+                                                 sampling_rate=sampling_rate, duration=duration)
+    elif selected_fault == "Bearing Fault":
+        bpfo = st.sidebar.slider("BPFO Frequency", 20, 100, 40)
+        t, signal = generate_bearing_fault_signal(bpfo=bpfo, sampling_rate=sampling_rate, duration=duration,
+                                                  fault_amp=fault_amp)
+
+# ------------------------------
+# Time-Domain Signal Analysis
+# ------------------------------
+
+st.subheader("Time-Domain Signal Analysis")
+st.markdown(
+    """
+    **Understanding the Basics:**
+    Time-domain analysis helps identify the nature of the fault by studying signal amplitude over time.
+    """
+)
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=t, y=signal, mode="lines", name="Signal"))
+fig.update_layout(title="Time-Domain Signal", xaxis_title="Time (s)", yaxis_title="Amplitude")
+st.plotly_chart(fig)
+
+# ------------------------------
+# DWT Decomposition Visualization
+# ------------------------------
+
+st.subheader("Wavelet Decomposition")
+st.markdown(
+    """
+    **Wavelet Transform:**
+    Wavelet analysis is ideal for detecting transient faults and localized disturbances in machinery signals.
+    """
+)
+coeffs = perform_dwt_analysis(signal, wavelet=wavelet_type, level=decomposition_level)
+fig = go.Figure()
+for i, coeff in enumerate(coeffs):
+    fig.add_trace(go.Scatter3d(x=np.arange(len(coeff)), y=np.full(len(coeff), i + 1), z=coeff, mode="lines",
+                               name=f"Level {i + 1}"))
+fig.update_layout(title="3D Wavelet Coefficients",
+                  scene=dict(xaxis_title="Samples", yaxis_title="Level", zaxis_title="Amplitude"))
+st.plotly_chart(fig)
+
+# ------------------------------
+# Signal Filtering and Frequency Spectrum
+# ------------------------------
+
+cutoff_frequency = st.sidebar.slider("Cutoff Frequency", 10, 200, 50)
+filtered_signal = butter_filter(signal, cutoff=cutoff_frequency, fs=sampling_rate)
+
+frequencies, psd = welch(filtered_signal, fs=sampling_rate)
+fig = go.Figure()
+fig.add_trace(go.Scatter3d(x=frequencies, y=frequencies, z=psd, mode="markers",
+                           marker=dict(size=3, color=psd, colorscale="Viridis", showscale=True)))
+fig.update_layout(title="3D Frequency Spectrum",
+                  scene=dict(xaxis_title="Frequency (Hz)", yaxis_title="Frequency (Hz)", zaxis_title="Power"))
+st.plotly_chart(fig)
+
+# ------------------------------
+# Fault Severity and Alerts (Removed display_severity)
+# ------------------------------
+
+severity = calculate_severity(coeffs)
+if severity > 1000:
+    st.error("High Severity Fault!")
+elif severity > 500:
+    st.warning("Moderate Fault Detected")
