@@ -5,6 +5,3 @@ pywavelets
 plotly
 scipy
 websocket-client
-threading
-json
-scikit-learn
